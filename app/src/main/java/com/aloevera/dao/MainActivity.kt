@@ -1,16 +1,17 @@
 package com.aloevera.dao
 
 import android.app.Activity
-import android.app.DownloadManager
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Environment
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
@@ -31,6 +32,7 @@ class MainActivity : Activity() {
 
     private val accent = Color.parseColor("#00796B")
     private lateinit var urlInput: EditText
+    private lateinit var filterInput: EditText
     private lateinit var btnScan: Button
     private lateinit var btnDownload: Button
     private lateinit var status: TextView
@@ -39,15 +41,22 @@ class MainActivity : Activity() {
 
     private val rows = ArrayList<Row>()
     private val selected = HashSet<String>()
+    private var allFiles: List<FoundFile> = emptyList()
+    private var visibleFiles: List<FoundFile> = emptyList()
     private var crawler: Crawler? = null
     private var scanning = false
     private var currentHost = ""
     private var startUrl = ""
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Downloader.init(this)
+
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -84,6 +93,39 @@ class MainActivity : Activity() {
         status.setPadding(0, dp(6), 0, dp(6))
         root.addView(status)
 
+        filterInput = EditText(this)
+        filterInput.hint = "Filtrar por nome ou tipo (ex.: mp3, flac)"
+        filterInput.setSingleLine(true)
+        filterInput.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {
+                applyFilter()
+            }
+
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        })
+        root.addView(filterInput)
+
+        val markRow = LinearLayout(this)
+        markRow.orientation = LinearLayout.HORIZONTAL
+        val btnMark = Button(this)
+        btnMark.text = "Marcar visíveis"
+        btnMark.setOnClickListener {
+            visibleFiles.forEach { selected.add(it.url) }
+            adapter.notifyDataSetChanged()
+            updateButton()
+        }
+        markRow.addView(btnMark, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val btnClearMarks = Button(this)
+        btnClearMarks.text = "Limpar marcas"
+        btnClearMarks.setOnClickListener {
+            selected.clear()
+            adapter.notifyDataSetChanged()
+            updateButton()
+        }
+        markRow.addView(btnClearMarks, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(markRow)
+
         list = ListView(this)
         adapter = RowAdapter()
         list.adapter = adapter
@@ -109,14 +151,8 @@ class MainActivity : Activity() {
         btnDownload.setOnClickListener { downloadSelected() }
         bottom.addView(btnDownload, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val btnView = Button(this)
-        btnView.text = "Ver downloads"
-        btnView.setOnClickListener {
-            try {
-                startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
-            } catch (e: Exception) {
-                toast("Não consegui abrir os downloads")
-            }
-        }
+        btnView.text = "Downloads"
+        btnView.setOnClickListener { startActivity(Intent(this, DownloadsActivity::class.java)) }
         bottom.addView(btnView)
         root.addView(bottom)
 
@@ -170,10 +206,9 @@ class MainActivity : Activity() {
         crawler = c
         scanning = true
         btnScan.text = "Parar"
-        rows.clear()
+        allFiles = emptyList()
         selected.clear()
-        adapter.notifyDataSetChanged()
-        updateButton()
+        applyFilter()
         status.text = "Analisando…"
 
         Thread {
@@ -188,7 +223,8 @@ class MainActivity : Activity() {
                 scanning = false
                 btnScan.text = "Analisar"
                 currentHost = c.host
-                showResults(result)
+                allFiles = result
+                applyFilter()
                 status.text = when {
                     err != null -> "Erro: $err"
                     result.isEmpty() -> "Nenhum arquivo encontrado. O site pode exigir login ou carregar tudo por JavaScript."
@@ -198,10 +234,18 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun showResults(files: List<FoundFile>) {
+    private fun applyFilter() {
+        val tokens = filterInput.text.toString().lowercase()
+            .split(",")
+            .map { it.trim().trimStart('.') }
+            .filter { it.isNotEmpty() }
+        val visible = if (tokens.isEmpty()) allFiles else allFiles.filter { f ->
+            val n = f.relPath.lowercase()
+            tokens.any { n.contains(it) }
+        }
+        visibleFiles = visible
         rows.clear()
-        selected.clear()
-        val grouped = files.groupBy { it.category }
+        val grouped = visible.groupBy { it.category }
         for (cat in FileTypes.order) {
             val items = grouped[cat] ?: continue
             rows.add(Row.Header(cat, items))
@@ -211,38 +255,17 @@ class MainActivity : Activity() {
         updateButton()
     }
 
-    private fun safe(s: String): String =
-        s.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().take(120)
-
     private fun downloadSelected() {
-        val chosen = rows.filterIsInstance<Row.Item>().map { it.file }.filter { selected.contains(it.url) }
+        val chosen = allFiles.filter { selected.contains(it.url) }
         if (chosen.isEmpty()) {
             toast("Marque ao menos um arquivo")
             return
         }
-        val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        var ok = 0
-        for (f in chosen) {
-            try {
-                val rel = f.relPath.split("/")
-                    .map { safe(it) }
-                    .filter { it.isNotEmpty() && it != "." && it != ".." }
-                    .joinToString("/")
-                if (rel.isEmpty()) continue
-                val dest = "DAO/" + safe(currentHost) + "/" + rel
-                val req = DownloadManager.Request(Uri.parse(f.url))
-                req.setTitle(f.name)
-                req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, dest)
-                req.addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) DAO/1.0")
-                req.addRequestHeader("Referer", startUrl)
-                dm.enqueue(req)
-                ok++
-            } catch (e: Exception) {
-                // pula o arquivo com problema e segue
-            }
-        }
-        toast("$ok downloads iniciados. Pasta: Downloads/DAO/$currentHost")
+        Downloader.addAll(chosen, currentHost, startUrl)
+        selected.clear()
+        adapter.notifyDataSetChanged()
+        updateButton()
+        startActivity(Intent(this, DownloadsActivity::class.java))
     }
 
     private inner class RowAdapter : BaseAdapter() {
