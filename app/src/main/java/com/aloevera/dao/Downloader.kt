@@ -47,9 +47,6 @@ class DlTask(
     @Volatile var speed = 0L
     @Volatile var destLabel = ""
     @Volatile var savedUri: Uri? = null
-    @Volatile var savedUri: android.net.Uri? = null
-    @Volatile var savedMime: String? = null
-    @Volatile var savedLabel: String = ""
 
     fun downloaded(): Long {
         if (!ranges) return plainDone
