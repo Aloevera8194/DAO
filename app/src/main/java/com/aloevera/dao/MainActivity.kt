@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
@@ -24,7 +25,13 @@ import android.widget.TextView
 import android.widget.Toast
 
 sealed class Row {
-    data class Header(val category: String, val items: List<FoundFile>) : Row()
+    data class Header(
+        val id: String,
+        val title: String,
+        val items: List<FoundFile>,
+        val collapsed: Boolean
+    ) : Row()
+
     data class Item(val file: FoundFile) : Row()
 }
 
@@ -35,14 +42,17 @@ class MainActivity : Activity() {
     private lateinit var filterInput: EditText
     private lateinit var btnScan: Button
     private lateinit var btnDownload: Button
+    private lateinit var btnGroup: Button
     private lateinit var status: TextView
     private lateinit var list: ListView
     private lateinit var adapter: RowAdapter
 
     private val rows = ArrayList<Row>()
     private val selected = HashSet<String>()
+    private val collapsed = HashSet<String>()
     private var allFiles: List<FoundFile> = emptyList()
     private var visibleFiles: List<FoundFile> = emptyList()
+    private var groupByFolder = true
     private var crawler: Crawler? = null
     private var scanning = false
     private var currentHost = ""
@@ -108,16 +118,14 @@ class MainActivity : Activity() {
 
         val markRow = LinearLayout(this)
         markRow.orientation = LinearLayout.HORIZONTAL
-        val btnMark = Button(this)
-        btnMark.text = "Marcar visíveis"
+        val btnMark = smallButton("Marcar visíveis")
         btnMark.setOnClickListener {
             visibleFiles.forEach { selected.add(it.url) }
             adapter.notifyDataSetChanged()
             updateButton()
         }
         markRow.addView(btnMark, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val btnClearMarks = Button(this)
-        btnClearMarks.text = "Limpar marcas"
+        val btnClearMarks = smallButton("Limpar marcas")
         btnClearMarks.setOnClickListener {
             selected.clear()
             adapter.notifyDataSetChanged()
@@ -126,22 +134,41 @@ class MainActivity : Activity() {
         markRow.addView(btnClearMarks, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(markRow)
 
+        val viewRow = LinearLayout(this)
+        viewRow.orientation = LinearLayout.HORIZONTAL
+        btnGroup = smallButton("Agrupar: Pastas")
+        btnGroup.setOnClickListener {
+            groupByFolder = !groupByFolder
+            btnGroup.text = if (groupByFolder) "Agrupar: Pastas" else "Agrupar: Tipos"
+            rebuildRows()
+        }
+        viewRow.addView(btnGroup, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f))
+        val btnCollapseAll = smallButton("Recolher tudo")
+        btnCollapseAll.setOnClickListener { setAllCollapsed(true) }
+        viewRow.addView(btnCollapseAll, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val btnExpandAll = smallButton("Abrir tudo")
+        btnExpandAll.setOnClickListener { setAllCollapsed(false) }
+        viewRow.addView(btnExpandAll, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(viewRow)
+
         list = ListView(this)
         adapter = RowAdapter()
         list.adapter = adapter
         list.setOnItemClickListener { _, _, position, _ ->
-            when (val r = rows[position]) {
-                is Row.Header -> {
-                    val all = r.items.all { selected.contains(it.url) }
-                    if (all) r.items.forEach { selected.remove(it.url) }
-                    else r.items.forEach { selected.add(it.url) }
+            if (position < rows.size) {
+                when (val r = rows[position]) {
+                    is Row.Header -> {
+                        val all = r.items.all { selected.contains(it.url) }
+                        if (all) r.items.forEach { selected.remove(it.url) }
+                        else r.items.forEach { selected.add(it.url) }
+                    }
+                    is Row.Item -> {
+                        if (!selected.add(r.file.url)) selected.remove(r.file.url)
+                    }
                 }
-                is Row.Item -> {
-                    if (!selected.add(r.file.url)) selected.remove(r.file.url)
-                }
+                adapter.notifyDataSetChanged()
+                updateButton()
             }
-            adapter.notifyDataSetChanged()
-            updateButton()
         }
         root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
@@ -159,6 +186,13 @@ class MainActivity : Activity() {
         setContentView(root)
         updateButton()
         handleIntent(intent)
+    }
+
+    private fun smallButton(text: String): Button {
+        val b = Button(this)
+        b.text = text
+        b.textSize = 12f
+        return b
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -208,6 +242,7 @@ class MainActivity : Activity() {
         btnScan.text = "Parar"
         allFiles = emptyList()
         selected.clear()
+        collapsed.clear()
         applyFilter()
         status.text = "Analisando…"
 
@@ -234,25 +269,58 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun folderOf(f: FoundFile): String =
+        if (f.relPath.contains('/')) f.relPath.substringBeforeLast('/') else ""
+
     private fun applyFilter() {
         val tokens = filterInput.text.toString().lowercase()
             .split(",")
             .map { it.trim().trimStart('.') }
             .filter { it.isNotEmpty() }
-        val visible = if (tokens.isEmpty()) allFiles else allFiles.filter { f ->
+        visibleFiles = if (tokens.isEmpty()) allFiles else allFiles.filter { f ->
             val n = f.relPath.lowercase()
             tokens.any { n.contains(it) }
         }
-        visibleFiles = visible
+        rebuildRows()
+    }
+
+    private fun groups(): List<Triple<String, String, List<FoundFile>>> {
+        val out = ArrayList<Triple<String, String, List<FoundFile>>>()
+        if (groupByFolder) {
+            val grouped = visibleFiles.groupBy { folderOf(it) }
+            for (key in grouped.keys.sortedBy { it.lowercase() }) {
+                val items = (grouped[key] ?: continue).sortedBy { it.name.lowercase() }
+                out.add(Triple("f:$key", if (key.isEmpty()) "(pasta raiz)" else key, items))
+            }
+        } else {
+            val grouped = visibleFiles.groupBy { it.category }
+            for (cat in FileTypes.order) {
+                val items = (grouped[cat] ?: continue).sortedBy { it.relPath.lowercase() }
+                out.add(Triple("t:$cat", cat, items))
+            }
+        }
+        return out
+    }
+
+    private fun rebuildRows() {
         rows.clear()
-        val grouped = visible.groupBy { it.category }
-        for (cat in FileTypes.order) {
-            val items = grouped[cat] ?: continue
-            rows.add(Row.Header(cat, items))
-            for (f in items.sortedBy { it.relPath.lowercase() }) rows.add(Row.Item(f))
+        for ((id, title, items) in groups()) {
+            val isCollapsed = collapsed.contains(id)
+            rows.add(Row.Header(id, title, items, isCollapsed))
+            if (!isCollapsed) {
+                for (f in items) rows.add(Row.Item(f))
+            }
         }
         adapter.notifyDataSetChanged()
         updateButton()
+    }
+
+    private fun setAllCollapsed(value: Boolean) {
+        for ((id, _, _) in groups()) {
+            if (value) collapsed.add(id) else collapsed.remove(id)
+        }
+        rebuildRows()
+        list.setSelection(0)
     }
 
     private fun downloadSelected() {
@@ -278,38 +346,77 @@ class MainActivity : Activity() {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
             return when (val row = rows[position]) {
                 is Row.Header -> {
-                    val cb = (convertView as? CheckBox) ?: CheckBox(this@MainActivity).also {
-                        it.isClickable = false
-                        it.isFocusable = false
-                        it.textSize = 16f
-                        it.setTypeface(null, Typeface.BOLD)
-                        it.setBackgroundColor(Color.parseColor("#E0F2F1"))
-                        it.setPadding(dp(8), dp(12), dp(8), dp(12))
-                    }
-                    cb.text = "${row.category} (${row.items.size})"
-                    cb.isChecked = row.items.all { selected.contains(it.url) }
-                    cb
-                }
-                is Row.Item -> {
                     val box = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).also {
-                        it.orientation = LinearLayout.VERTICAL
-                        it.setPadding(dp(8), dp(6), dp(8), dp(6))
+                        it.orientation = LinearLayout.HORIZONTAL
+                        it.gravity = Gravity.CENTER_VERTICAL
+                        it.setBackgroundColor(Color.parseColor("#E0F2F1"))
+                        it.setPadding(dp(8), dp(2), dp(4), dp(2))
                         val cb = CheckBox(this@MainActivity)
                         cb.isClickable = false
                         cb.isFocusable = false
                         cb.textSize = 15f
-                        it.addView(cb)
+                        cb.setTypeface(null, Typeface.BOLD)
+                        it.addView(cb, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                        val fold = Button(this@MainActivity)
+                        fold.isFocusable = false
+                        fold.textSize = 12f
+                        it.addView(fold)
+                    }
+                    val cb = box.getChildAt(0) as CheckBox
+                    val fold = box.getChildAt(1) as Button
+                    val count = row.items.count { selected.contains(it.url) }
+                    cb.text = "${row.title} ($count/${row.items.size})"
+                    cb.isChecked = count == row.items.size && count > 0
+                    fold.text = if (row.collapsed) "Abrir" else "Recolher"
+                    fold.setOnClickListener {
+                        if (collapsed.contains(row.id)) collapsed.remove(row.id) else collapsed.add(row.id)
+                        rebuildRows()
+                    }
+                    box
+                }
+                is Row.Item -> {
+                    val box = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).also {
+                        it.orientation = LinearLayout.HORIZONTAL
+                        it.gravity = Gravity.CENTER_VERTICAL
+                        it.setPadding(dp(8), dp(4), dp(8), dp(4))
+                        val inner = LinearLayout(this@MainActivity)
+                        inner.orientation = LinearLayout.VERTICAL
+                        val cb = CheckBox(this@MainActivity)
+                        cb.isClickable = false
+                        cb.isFocusable = false
+                        cb.textSize = 15f
+                        inner.addView(cb)
                         val tv = TextView(this@MainActivity)
                         tv.textSize = 12f
                         tv.setTextColor(Color.GRAY)
                         tv.setPadding(dp(40), 0, 0, 0)
-                        it.addView(tv)
+                        inner.addView(tv)
+                        it.addView(inner, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                        val pv = Button(this@MainActivity)
+                        pv.text = "▶"
+                        pv.isFocusable = false
+                        pv.minWidth = dp(48)
+                        pv.minimumWidth = dp(48)
+                        it.addView(pv)
                     }
-                    val cb = box.getChildAt(0) as CheckBox
-                    val tv = box.getChildAt(1) as TextView
+                    val inner = box.getChildAt(0) as LinearLayout
+                    val cb = inner.getChildAt(0) as CheckBox
+                    val tv = inner.getChildAt(1) as TextView
+                    val pv = box.getChildAt(1) as Button
                     cb.text = row.file.name
                     cb.isChecked = selected.contains(row.file.url)
-                    tv.text = row.file.relPath
+                    if (groupByFolder) {
+                        tv.visibility = View.GONE
+                    } else {
+                        tv.visibility = View.VISIBLE
+                        tv.text = row.file.relPath
+                    }
+                    if (Preview.canPreview(row.file.category)) {
+                        pv.visibility = View.VISIBLE
+                        pv.setOnClickListener { Preview.show(this@MainActivity, row.file, startUrl) }
+                    } else {
+                        pv.visibility = View.GONE
+                    }
                     box
                 }
             }

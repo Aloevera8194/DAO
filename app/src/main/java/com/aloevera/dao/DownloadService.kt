@@ -28,7 +28,7 @@ class DownloadService : Service() {
                     val n = Notification.Builder(this@DownloadService, CHANNEL)
                         .setSmallIcon(android.R.drawable.stat_sys_download_done)
                         .setContentTitle("DAO · downloads concluídos")
-                        .setContentText("$done arquivo(s) em Downloads/DAO")
+                        .setContentText("$done arquivo(s) salvo(s) na pasta DAO")
                         .setContentIntent(openIntent())
                         .setAutoCancel(true)
                         .build()

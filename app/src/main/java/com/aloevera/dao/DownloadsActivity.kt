@@ -1,7 +1,6 @@
 package com.aloevera.dao
 
 import android.app.Activity
-import android.app.DownloadManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -16,6 +15,7 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 
 class DownloadsActivity : Activity() {
 
@@ -52,25 +52,13 @@ class DownloadsActivity : Activity() {
         summary.setPadding(0, dp(4), 0, dp(6))
         root.addView(summary)
 
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
         val btnClear = Button(this)
         btnClear.text = "Limpar concluídos"
         btnClear.setOnClickListener {
             Downloader.clearFinished()
             adapter.notifyDataSetChanged()
         }
-        row.addView(btnClear, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val btnFolder = Button(this)
-        btnFolder.text = "Abrir Downloads"
-        btnFolder.setOnClickListener {
-            try {
-                startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
-            } catch (e: Exception) {
-            }
-        }
-        row.addView(btnFolder, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(row)
+        root.addView(btnClear)
 
         val list = ListView(this)
         adapter = TaskAdapter()
@@ -97,6 +85,22 @@ class DownloadsActivity : Activity() {
         val done = all.count { it.state == State.DONE }
         val err = all.count { it.state == State.ERROR }
         summary.text = "$running baixando · $queued na fila · $done concluídos · $err com erro"
+    }
+
+    private fun openFile(t: DlTask) {
+        val uri = t.savedUri
+        if (uri == null) {
+            Toast.makeText(this, "Arquivo não encontrado", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val i = Intent(Intent.ACTION_VIEW)
+            i.setDataAndType(uri, contentResolver.getType(uri))
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(i)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Nenhum app para abrir este arquivo", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun buildRow(): LinearLayout {
@@ -127,6 +131,10 @@ class DownloadsActivity : Activity() {
         bCancel.textSize = 12f
         bCancel.text = "Cancelar"
         btns.addView(bCancel)
+        val bOpen = Button(this)
+        bOpen.textSize = 12f
+        bOpen.text = "Abrir"
+        btns.addView(bOpen)
         box.addView(btns)
         return box
     }
@@ -145,6 +153,7 @@ class DownloadsActivity : Activity() {
             val btns = box.getChildAt(3) as LinearLayout
             val bPause = btns.getChildAt(0) as Button
             val bCancel = btns.getChildAt(1) as Button
+            val bOpen = btns.getChildAt(2) as Button
 
             name.text = t.name
             val pct = t.percent()
@@ -160,8 +169,8 @@ class DownloadsActivity : Activity() {
                     "$pct% · ${fmtBytes(t.downloaded())} de $tot · ${fmtBytes(t.speed)}/s$conns"
                 }
                 State.PAUSED -> "Pausado · $pct%"
-                State.SAVING -> "Salvando em Downloads/DAO…"
-                State.DONE -> "Concluído · ${fmtBytes(t.total)} · Downloads/DAO/${t.host}"
+                State.SAVING -> "Salvando no celular…"
+                State.DONE -> "Concluído · ${fmtBytes(t.total)} · ${t.destLabel}"
                 State.ERROR -> "Erro: ${t.error ?: "desconhecido"}"
                 State.CANCELED -> "Cancelado"
             }
@@ -170,6 +179,7 @@ class DownloadsActivity : Activity() {
                 t.state == State.PAUSED || t.state == State.ERROR
             bPause.visibility = if (canAct) View.VISIBLE else View.GONE
             bCancel.visibility = if (canAct) View.VISIBLE else View.GONE
+            bOpen.visibility = if (t.state == State.DONE && t.savedUri != null) View.VISIBLE else View.GONE
             bPause.text = when (t.state) {
                 State.PAUSED -> "Continuar"
                 State.ERROR -> "Tentar de novo"
@@ -183,6 +193,7 @@ class DownloadsActivity : Activity() {
                 Downloader.cancel(t)
                 notifyDataSetChanged()
             }
+            bOpen.setOnClickListener { openFile(t) }
             return box
         }
     }

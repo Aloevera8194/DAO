@@ -3,6 +3,7 @@ package com.aloevera.dao
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
@@ -24,7 +25,8 @@ class DlTask(
     val name: String,
     val relPath: String,
     val host: String,
-    val referer: String
+    val referer: String,
+    val category: String
 ) {
     @Volatile var state = State.QUEUED
     @Volatile var total = -1L
@@ -43,6 +45,11 @@ class DlTask(
     @Volatile var lastBytes = 0L
     @Volatile var lastTime = 0L
     @Volatile var speed = 0L
+    @Volatile var destLabel = ""
+    @Volatile var savedUri: Uri? = null
+    @Volatile var savedUri: android.net.Uri? = null
+    @Volatile var savedMime: String? = null
+    @Volatile var savedLabel: String = ""
 
     fun downloaded(): Long {
         if (!ranges) return plainDone
@@ -79,7 +86,7 @@ object Downloader {
     val tasks = CopyOnWriteArrayList<DlTask>()
     var connections = 4
 
-    private const val UA = "Mozilla/5.0 (Linux; Android 13; Mobile) DAO/2.0"
+    private const val UA = "Mozilla/5.0 (Linux; Android 13; Mobile) DAO/3.0"
     private val pool = Executors.newFixedThreadPool(2)
     private var nextId = 1
     private var app: Context? = null
@@ -91,7 +98,7 @@ object Downloader {
     fun addAll(files: List<FoundFile>, host: String, referer: String) {
         synchronized(this) {
             for (f in files) {
-                val t = DlTask(nextId++, f.url, f.name, f.relPath, host, referer)
+                val t = DlTask(nextId++, f.url, f.name, f.relPath, host, referer, f.category)
                 tasks.add(t)
                 pool.execute { runTask(t) }
             }
@@ -363,6 +370,33 @@ object Downloader {
     private fun safe(s: String): String =
         s.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().take(120)
 
+    private fun target(category: String, mime: String): Pair<Uri, String> {
+        return when {
+            category == "Áudio" && mime.startsWith("audio/") ->
+                Pair(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MUSIC)
+            category == "Vídeo" && mime.startsWith("video/") ->
+                Pair(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MOVIES)
+            category == "Imagens" && mime.startsWith("image/") ->
+                Pair(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_PICTURES)
+            category == "Documentos" ->
+                Pair(MediaStore.Files.getContentUri("external"), Environment.DIRECTORY_DOCUMENTS)
+            else ->
+                Pair(MediaStore.Downloads.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_DOWNLOADS)
+        }
+    }
+
+    private fun insertEntry(
+        c: Context, collection: Uri, base: String, host: String,
+        dirs: String, fileName: String, mime: String
+    ): Uri? {
+        val values = ContentValues()
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+        values.put(MediaStore.MediaColumns.MIME_TYPE, mime)
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, base + "/DAO/" + safe(host) + "/" + dirs)
+        values.put(MediaStore.MediaColumns.IS_PENDING, 1)
+        return c.contentResolver.insert(collection, values)
+    }
+
     private fun saveToDownloads(t: DlTask) {
         val c = app ?: throw IOException("app não iniciado")
         val tmp = t.tmp ?: throw IOException("arquivo temporário perdido")
@@ -374,27 +408,33 @@ object Downloader {
         val ext = fileName.substringAfterLast('.', "").lowercase()
         val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
 
-        val values = ContentValues()
-        values.put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-        values.put(MediaStore.Downloads.MIME_TYPE, mime)
-        values.put(
-            MediaStore.Downloads.RELATIVE_PATH,
-            Environment.DIRECTORY_DOWNLOADS + "/DAO/" + safe(t.host) + "/" + dirs
-        )
-        values.put(MediaStore.Downloads.IS_PENDING, 1)
-
+        val (collection, base) = target(t.category, mime)
+        var usedBase = base
+        var uri: Uri? = try {
+            insertEntry(c, collection, base, t.host, dirs, fileName, mime)
+        } catch (e: Exception) {
+            null
+        }
+        if (uri == null) {
+            usedBase = Environment.DIRECTORY_DOWNLOADS
+            uri = insertEntry(
+                c, MediaStore.Downloads.EXTERNAL_CONTENT_URI, usedBase,
+                t.host, dirs, fileName, mime
+            )
+        }
+        val finalUri = uri ?: throw IOException("Não consegui criar o arquivo no celular")
         val resolver = c.contentResolver
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: throw IOException("Não consegui criar o arquivo em Downloads")
         try {
-            val out = resolver.openOutputStream(uri) ?: throw IOException("Não consegui gravar em Downloads")
+            val out = resolver.openOutputStream(finalUri) ?: throw IOException("Não consegui gravar o arquivo")
             out.use { o -> tmp.inputStream().use { it.copyTo(o, 65536) } }
             val done = ContentValues()
-            done.put(MediaStore.Downloads.IS_PENDING, 0)
-            resolver.update(uri, done, null, null)
+            done.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            resolver.update(finalUri, done, null, null)
         } catch (e: Exception) {
-            resolver.delete(uri, null, null)
+            resolver.delete(finalUri, null, null)
             throw e
         }
+        t.savedUri = finalUri
+        t.destLabel = usedBase + "/DAO/" + safe(t.host)
     }
 }
