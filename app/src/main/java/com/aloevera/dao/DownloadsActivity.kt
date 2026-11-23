@@ -52,6 +52,24 @@ class DownloadsActivity : Activity() {
         summary.setPadding(0, dp(4), 0, dp(6))
         root.addView(summary)
 
+        val allRow = LinearLayout(this)
+        allRow.orientation = LinearLayout.HORIZONTAL
+        val btnPauseAll = Button(this)
+        btnPauseAll.text = "Pausar tudo"
+        btnPauseAll.setOnClickListener {
+            Downloader.pauseAll()
+            adapter.notifyDataSetChanged()
+        }
+        allRow.addView(btnPauseAll, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val btnResumeAll = Button(this)
+        btnResumeAll.text = "Continuar tudo"
+        btnResumeAll.setOnClickListener {
+            Downloader.resumeAll()
+            adapter.notifyDataSetChanged()
+        }
+        allRow.addView(btnResumeAll, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(allRow)
+
         val btnClear = Button(this)
         btnClear.text = "Limpar concluídos"
         btnClear.setOnClickListener {
@@ -84,7 +102,11 @@ class DownloadsActivity : Activity() {
         val queued = all.count { it.state == State.QUEUED }
         val done = all.count { it.state == State.DONE }
         val err = all.count { it.state == State.ERROR }
-        summary.text = "$running baixando · $queued na fila · $done concluídos · $err com erro"
+        val paused = all.count { it.state == State.PAUSED }
+        val ask = all.count { it.state == State.CONFLICT }
+        var txt = "$running baixando · $queued na fila · $paused pausados · $done concluídos · $err com erro"
+        if (ask > 0) txt += " · $ask esperando resposta"
+        summary.text = txt
     }
 
     private fun openFile(t: DlTask) {
@@ -136,6 +158,22 @@ class DownloadsActivity : Activity() {
         bOpen.text = "Abrir"
         btns.addView(bOpen)
         box.addView(btns)
+
+        val conflict = LinearLayout(this)
+        conflict.orientation = LinearLayout.HORIZONTAL
+        val cReplace = Button(this)
+        cReplace.textSize = 12f
+        cReplace.text = "Substituir"
+        conflict.addView(cReplace)
+        val cBoth = Button(this)
+        cBoth.textSize = 12f
+        cBoth.text = "Manter os dois"
+        conflict.addView(cBoth)
+        val cSkip = Button(this)
+        cSkip.textSize = 12f
+        cSkip.text = "Pular"
+        conflict.addView(cSkip)
+        box.addView(conflict)
         return box
     }
 
@@ -154,6 +192,10 @@ class DownloadsActivity : Activity() {
             val bPause = btns.getChildAt(0) as Button
             val bCancel = btns.getChildAt(1) as Button
             val bOpen = btns.getChildAt(2) as Button
+            val conflict = box.getChildAt(4) as LinearLayout
+            val cReplace = conflict.getChildAt(0) as Button
+            val cBoth = conflict.getChildAt(1) as Button
+            val cSkip = conflict.getChildAt(2) as Button
 
             name.text = t.name
             val pct = t.percent()
@@ -169,7 +211,9 @@ class DownloadsActivity : Activity() {
                     "$pct% · ${fmtBytes(t.downloaded())} de $tot · ${fmtBytes(t.speed)}/s$conns"
                 }
                 State.PAUSED -> "Pausado · $pct%"
-                State.SAVING -> "Salvando no celular…"
+                State.SAVING -> "Salvando no destino…"
+                State.CONFLICT -> "Este arquivo já existe no destino. O que fazer?"
+                State.SKIPPED -> "Já existia · ignorado"
                 State.DONE -> "Concluído · ${fmtBytes(t.total)} · ${t.destLabel}"
                 State.ERROR -> "Erro: ${t.error ?: "desconhecido"}"
                 State.CANCELED -> "Cancelado"
@@ -194,6 +238,20 @@ class DownloadsActivity : Activity() {
                 notifyDataSetChanged()
             }
             bOpen.setOnClickListener { openFile(t) }
+
+            conflict.visibility = if (t.state == State.CONFLICT) View.VISIBLE else View.GONE
+            cReplace.setOnClickListener {
+                Downloader.resolve(t, OnExists.OVERWRITE)
+                notifyDataSetChanged()
+            }
+            cBoth.setOnClickListener {
+                Downloader.resolve(t, OnExists.RENAME)
+                notifyDataSetChanged()
+            }
+            cSkip.setOnClickListener {
+                Downloader.resolve(t, OnExists.SKIP)
+                notifyDataSetChanged()
+            }
             return box
         }
     }

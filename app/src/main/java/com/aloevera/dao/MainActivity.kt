@@ -181,6 +181,10 @@ class MainActivity : Activity() {
         btnView.text = "Downloads"
         btnView.setOnClickListener { startActivity(Intent(this, DownloadsActivity::class.java)) }
         bottom.addView(btnView)
+        val btnSettings = Button(this)
+        btnSettings.text = "⚙"
+        btnSettings.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+        bottom.addView(btnSettings)
         root.addView(bottom)
 
         setContentView(root)

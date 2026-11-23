@@ -21,6 +21,7 @@ class DownloadService : Service() {
                 it.state == State.QUEUED || it.state == State.RUNNING || it.state == State.SAVING
             }
             val nm = getSystemService(NotificationManager::class.java)
+            Downloader.persist()
             if (active.isEmpty()) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 val done = Downloader.tasks.count { it.state == State.DONE }
@@ -28,7 +29,7 @@ class DownloadService : Service() {
                     val n = Notification.Builder(this@DownloadService, CHANNEL)
                         .setSmallIcon(android.R.drawable.stat_sys_download_done)
                         .setContentTitle("DAO · downloads concluídos")
-                        .setContentText("$done arquivo(s) salvo(s) na pasta DAO")
+                        .setContentText("$done arquivo(s) concluído(s)")
                         .setContentIntent(openIntent())
                         .setAutoCancel(true)
                         .build()

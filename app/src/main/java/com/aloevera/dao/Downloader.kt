@@ -1,12 +1,10 @@
 package com.aloevera.dao
 
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Environment
-import android.provider.MediaStore
-import android.webkit.MimeTypeMap
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -17,7 +15,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLongArray
 
-enum class State { QUEUED, RUNNING, PAUSED, SAVING, DONE, ERROR, CANCELED }
+enum class State { QUEUED, RUNNING, PAUSED, SAVING, DONE, ERROR, CANCELED, CONFLICT, SKIPPED }
 
 class DlTask(
     val id: Int,
@@ -47,6 +45,8 @@ class DlTask(
     @Volatile var speed = 0L
     @Volatile var destLabel = ""
     @Volatile var savedUri: Uri? = null
+    @Volatile var decision: OnExists? = null
+    @Volatile var conflictChecked = false
 
     fun downloaded(): Long {
         if (!ranges) return plainDone
@@ -88,8 +88,135 @@ object Downloader {
     private var nextId = 1
     private var app: Context? = null
 
+    private val storeLock = Any()
+
     fun init(c: Context) {
+        if (app != null) return
         app = c.applicationContext
+        Settings.init(c)
+        load(c)
+    }
+
+    private fun partsDir(c: Context): File {
+        val dir = c.getExternalFilesDir("partes") ?: File(c.filesDir, "partes")
+        dir.mkdirs()
+        return dir
+    }
+
+    // ------------------------------------------------------------ persistência
+
+    /** Grava a lista de downloads em disco, para sobreviver ao fechamento do app. */
+    fun persist() {
+        val c = app ?: return
+        synchronized(storeLock) {
+            try {
+                val arr = JSONArray()
+                for (t in tasks) {
+                    if (t.state == State.CANCELED) continue
+                    val o = JSONObject()
+                    o.put("id", t.id)
+                    o.put("url", t.url)
+                    o.put("name", t.name)
+                    o.put("relPath", t.relPath)
+                    o.put("host", t.host)
+                    o.put("referer", t.referer)
+                    o.put("category", t.category)
+                    o.put("state", t.state.name)
+                    o.put("total", t.total)
+                    o.put("finalUrl", t.finalUrl)
+                    o.put("ranges", t.ranges)
+                    o.put("error", t.error ?: JSONObject.NULL)
+                    o.put("decision", t.decision?.name ?: JSONObject.NULL)
+                    o.put("destLabel", t.destLabel)
+                    o.put("savedUri", t.savedUri?.toString() ?: JSONObject.NULL)
+                    val starts = t.segStart
+                    val ends = t.segEnd
+                    val done = t.segDone
+                    val n = minOf(starts.size, ends.size, done.length())
+                    if (t.ranges && n > 0) {
+                        val ss = JSONArray()
+                        val se = JSONArray()
+                        val sd = JSONArray()
+                        for (i in 0 until n) {
+                            ss.put(starts[i])
+                            se.put(ends[i])
+                            sd.put(done.get(i))
+                        }
+                        o.put("segStart", ss)
+                        o.put("segEnd", se)
+                        o.put("segDone", sd)
+                    }
+                    arr.put(o)
+                }
+                val root = JSONObject()
+                root.put("nextId", nextId)
+                root.put("tasks", arr)
+                val tmp = File(c.filesDir, "tasks.json.tmp")
+                tmp.writeText(root.toString())
+                tmp.renameTo(File(c.filesDir, "tasks.json"))
+            } catch (e: Exception) {
+                // não deixa um erro de gravação derrubar o download
+            }
+        }
+    }
+
+    private fun load(c: Context) {
+        val f = File(c.filesDir, "tasks.json")
+        if (!f.exists()) return
+        try {
+            val root = JSONObject(f.readText())
+            nextId = root.optInt("nextId", 1)
+            val arr = root.optJSONArray("tasks") ?: return
+            val dir = partsDir(c)
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val t = DlTask(
+                    o.getInt("id"), o.getString("url"), o.getString("name"),
+                    o.getString("relPath"), o.getString("host"),
+                    o.getString("referer"), o.getString("category")
+                )
+                var st = try {
+                    State.valueOf(o.getString("state"))
+                } catch (e: Exception) {
+                    State.PAUSED
+                }
+                // O que estava em andamento quando o app fechou volta como "pausado".
+                if (st == State.QUEUED || st == State.RUNNING || st == State.SAVING) st = State.PAUSED
+                t.total = o.optLong("total", -1L)
+                t.finalUrl = o.optString("finalUrl", t.url)
+                t.ranges = o.optBoolean("ranges", false)
+                t.error = if (o.isNull("error")) null else o.optString("error")
+                t.decision = if (o.isNull("decision")) null else try {
+                    OnExists.valueOf(o.getString("decision"))
+                } catch (e: Exception) {
+                    null
+                }
+                t.destLabel = o.optString("destLabel", "")
+                t.savedUri = if (o.isNull("savedUri")) null else Uri.parse(o.getString("savedUri"))
+
+                if (st != State.DONE && st != State.SKIPPED && t.ranges && o.has("segStart")) {
+                    val ss = o.getJSONArray("segStart")
+                    val se = o.getJSONArray("segEnd")
+                    val sd = o.getJSONArray("segDone")
+                    val n = ss.length()
+                    val part = File(dir, "${t.id}.part")
+                    // Só retoma de onde parou se o arquivo parcial ainda estiver íntegro.
+                    if (n > 0 && se.length() == n && sd.length() == n && part.exists() && part.length() == t.total) {
+                        t.segStart = LongArray(n) { ss.getLong(it) }
+                        t.segEnd = LongArray(n) { se.getLong(it) }
+                        val ad = AtomicLongArray(n)
+                        for (k in 0 until n) ad.set(k, sd.getLong(k))
+                        t.segDone = ad
+                        t.tmp = part
+                    }
+                }
+                t.state = st
+                tasks.add(t)
+                if (t.id >= nextId) nextId = t.id + 1
+            }
+        } catch (e: Exception) {
+            // arquivo corrompido: começa com a lista vazia
+        }
     }
 
     fun addAll(files: List<FoundFile>, host: String, referer: String) {
@@ -100,6 +227,7 @@ object Downloader {
                 pool.execute { runTask(t) }
             }
         }
+        persist()
         startService()
     }
 
@@ -119,6 +247,36 @@ object Downloader {
                 else -> {}
             }
         }
+        persist()
+    }
+
+    fun pauseAll() {
+        for (t in tasks) pause(t)
+    }
+
+    fun resumeAll() {
+        for (t in tasks) resume(t)
+    }
+
+    /** Resposta do usuário quando o arquivo já existe (substituir / manter os dois / pular). */
+    fun resolve(t: DlTask, choice: OnExists) {
+        synchronized(t) {
+            if (t.state != State.CONFLICT) return
+            if (choice == OnExists.SKIP || choice == OnExists.ASK) {
+                t.tmp?.delete()
+                t.tmp = null
+                t.state = State.SKIPPED
+                persist()
+                return
+            }
+            t.decision = choice
+            t.conflictChecked = true
+            t.stopFlag = false
+            t.state = State.QUEUED
+        }
+        pool.execute { runTask(t) }
+        startService()
+        persist()
     }
 
     fun resume(t: DlTask) {
@@ -133,21 +291,26 @@ object Downloader {
         }
         pool.execute { runTask(t) }
         startService()
+        persist()
     }
 
     fun cancel(t: DlTask) {
         synchronized(t) {
-            if (t.state == State.SAVING || t.state == State.DONE || t.state == State.CANCELED) return
+            if (t.state == State.SAVING || t.state == State.DONE ||
+                t.state == State.CANCELED || t.state == State.SKIPPED
+            ) return
             t.cancelFlag = true
             if (t.state != State.RUNNING) {
                 t.tmp?.delete()
                 t.state = State.CANCELED
             }
         }
+        persist()
     }
 
     fun clearFinished() {
-        tasks.removeIf { it.state == State.DONE || it.state == State.CANCELED }
+        tasks.removeIf { it.state == State.DONE || it.state == State.CANCELED || it.state == State.SKIPPED }
+        persist()
     }
 
     private fun finishCancel(t: DlTask) {
@@ -156,6 +319,33 @@ object Downloader {
     }
 
     private fun runTask(t: DlTask) {
+        runTaskInner(t)
+        persist()
+    }
+
+    /** Devolve true se a tarefa já foi resolvida (ignorada ou esperando resposta do usuário). */
+    private fun checkConflict(t: DlTask): Boolean {
+        val c = app ?: throw IOException("app não iniciado")
+        if (Storage.exists(c, Storage.targetOf(t))) {
+            when (val policy = t.decision ?: Settings.onExists) {
+                OnExists.SKIP -> {
+                    t.tmp?.delete()
+                    t.tmp = null
+                    t.state = State.SKIPPED
+                    return true
+                }
+                OnExists.ASK -> {
+                    t.state = State.CONFLICT
+                    return true
+                }
+                OnExists.RENAME, OnExists.OVERWRITE -> t.decision = policy
+            }
+        }
+        t.conflictChecked = true
+        return false
+    }
+
+    private fun runTaskInner(t: DlTask) {
         synchronized(t) {
             if (t.cancelFlag) {
                 t.state = State.CANCELED
@@ -170,6 +360,7 @@ object Downloader {
         }
         t.segError = null
         try {
+            if (!t.conflictChecked && checkConflict(t)) return
             if (t.tmp == null) prepare(t)
             if (t.cancelFlag) {
                 finishCancel(t)
@@ -190,7 +381,12 @@ object Downloader {
             }
             if (!t.ranges) t.total = t.plainDone
             t.state = State.SAVING
-            saveToDownloads(t)
+            val c = app ?: throw IOException("app não iniciado")
+            val tmpFile = t.tmp ?: throw IOException("arquivo temporário perdido")
+            val overwrite = (t.decision ?: Settings.onExists) == OnExists.OVERWRITE
+            val saved = Storage.save(c, Storage.targetOf(t), tmpFile, overwrite)
+            t.savedUri = saved.uri
+            t.destLabel = saved.label
             t.tmp?.delete()
             t.state = State.DONE
         } catch (e: Exception) {
@@ -256,9 +452,7 @@ object Downloader {
         }
 
         val c = app ?: throw IOException("app não iniciado")
-        val dir = c.getExternalFilesDir("partes") ?: File(c.filesDir, "partes")
-        dir.mkdirs()
-        val tmp = File(dir, "${t.id}.part")
+        val tmp = File(partsDir(c), "${t.id}.part")
         if (t.ranges) {
             RandomAccessFile(tmp, "rw").use { it.setLength(t.total) }
             val n = if (t.total < 2_000_000L) 1 else connections
@@ -362,76 +556,5 @@ object Downloader {
         } finally {
             o.conn.disconnect()
         }
-    }
-
-    private fun safe(s: String): String =
-        s.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().take(120)
-
-    private fun target(category: String, mime: String): Pair<Uri, String> {
-        return when {
-            category == "Áudio" && mime.startsWith("audio/") ->
-                Pair(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MUSIC)
-            category == "Vídeo" && mime.startsWith("video/") ->
-                Pair(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MOVIES)
-            category == "Imagens" && mime.startsWith("image/") ->
-                Pair(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_PICTURES)
-            category == "Documentos" ->
-                Pair(MediaStore.Files.getContentUri("external"), Environment.DIRECTORY_DOCUMENTS)
-            else ->
-                Pair(MediaStore.Downloads.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_DOWNLOADS)
-        }
-    }
-
-    private fun insertEntry(
-        c: Context, collection: Uri, base: String, host: String,
-        dirs: String, fileName: String, mime: String
-    ): Uri? {
-        val values = ContentValues()
-        values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-        values.put(MediaStore.MediaColumns.MIME_TYPE, mime)
-        values.put(MediaStore.MediaColumns.RELATIVE_PATH, base + "/DAO/" + safe(host) + "/" + dirs)
-        values.put(MediaStore.MediaColumns.IS_PENDING, 1)
-        return c.contentResolver.insert(collection, values)
-    }
-
-    private fun saveToDownloads(t: DlTask) {
-        val c = app ?: throw IOException("app não iniciado")
-        val tmp = t.tmp ?: throw IOException("arquivo temporário perdido")
-        val parts = t.relPath.split("/")
-            .map { safe(it) }
-            .filter { it.isNotEmpty() && it != "." && it != ".." }
-        val fileName = parts.lastOrNull() ?: safe(t.name)
-        val dirs = if (parts.size > 1) parts.dropLast(1).joinToString("/") + "/" else ""
-        val ext = fileName.substringAfterLast('.', "").lowercase()
-        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
-
-        val (collection, base) = target(t.category, mime)
-        var usedBase = base
-        var uri: Uri? = try {
-            insertEntry(c, collection, base, t.host, dirs, fileName, mime)
-        } catch (e: Exception) {
-            null
-        }
-        if (uri == null) {
-            usedBase = Environment.DIRECTORY_DOWNLOADS
-            uri = insertEntry(
-                c, MediaStore.Downloads.EXTERNAL_CONTENT_URI, usedBase,
-                t.host, dirs, fileName, mime
-            )
-        }
-        val finalUri = uri ?: throw IOException("Não consegui criar o arquivo no celular")
-        val resolver = c.contentResolver
-        try {
-            val out = resolver.openOutputStream(finalUri) ?: throw IOException("Não consegui gravar o arquivo")
-            out.use { o -> tmp.inputStream().use { it.copyTo(o, 65536) } }
-            val done = ContentValues()
-            done.put(MediaStore.MediaColumns.IS_PENDING, 0)
-            resolver.update(finalUri, done, null, null)
-        } catch (e: Exception) {
-            resolver.delete(finalUri, null, null)
-            throw e
-        }
-        t.savedUri = finalUri
-        t.destLabel = usedBase + "/DAO/" + safe(t.host)
     }
 }

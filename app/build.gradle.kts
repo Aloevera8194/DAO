@@ -46,3 +46,10 @@ android {
         checkReleaseBuilds = false
     }
 }
+
+dependencies {
+    // Escolher pasta (Storage Access Framework)
+    implementation("androidx.documentfile:documentfile:1.0.1")
+    // SFTP para enviar ao Raspberry Pi
+    implementation("com.github.mwiede:jsch:0.2.18")
+}
